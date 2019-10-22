@@ -140,11 +140,11 @@ static size_t unpack_u16_chunk(struct aa_ext *e, char **chunk)
 static bool unpack_X(struct aa_ext *e, enum aa_code code)
 {
 	if (!inbounds(e, 1))
-		return 0;
+		return false;
 	if (*(u8 *) e->pos != code)
-		return 0;
+		return false;
 	e->pos++;
-	return 1;
+	return true;
 }
 
 /**
@@ -186,37 +186,50 @@ static bool unpack_nameX(struct aa_ext *e, enum aa_code code, const char *name)
 
 	/* now check if type code matches */
 	if (unpack_X(e, code))
-		return 1;
+		return true;
 
 fail:
 	e->pos = pos;
-	return 0;
+	return false;
+}
+
+static bool unpack_u16(struct aa_ext *e, u16 *data, const char *name)
+{
+	if (unpack_nameX(e, AA_U16, name)) {
+		if (!inbounds(e, sizeof(u16)))
+			return false;
+		if (data)
+			*data = le16_to_cpu(get_unaligned((u16 *) e->pos));
+		e->pos += sizeof(u16);
+		return true;
+	}
+	return false;
 }
 
 static bool unpack_u32(struct aa_ext *e, u32 *data, const char *name)
 {
 	if (unpack_nameX(e, AA_U32, name)) {
 		if (!inbounds(e, sizeof(u32)))
-			return 0;
+			return false;
 		if (data)
 			*data = le32_to_cpu(get_unaligned((u32 *) e->pos));
 		e->pos += sizeof(u32);
-		return 1;
+		return true;
 	}
-	return 0;
+	return false;
 }
 
 static bool unpack_u64(struct aa_ext *e, u64 *data, const char *name)
 {
 	if (unpack_nameX(e, AA_U64, name)) {
 		if (!inbounds(e, sizeof(u64)))
-			return 0;
+			return false;
 		if (data)
 			*data = le64_to_cpu(get_unaligned((u64 *) e->pos));
 		e->pos += sizeof(u64);
-		return 1;
+		return true;
 	}
-	return 0;
+	return false;
 }
 
 static size_t unpack_array(struct aa_ext *e, const char *name)
@@ -309,12 +322,12 @@ static bool verify_accept(struct aa_dfa *dfa, int flags)
 		int mode = ACCEPT_TABLE(dfa)[i];
 
 		if (mode & ~DFA_VALID_PERM_MASK)
-			return 0;
+			return false;
 
 		if (ACCEPT_TABLE2(dfa)[i] & ~DFA_VALID_PERM2_MASK)
-			return 0;
+			return false;
 	}
-	return 1;
+	return true;
 }
 
 /**
@@ -424,12 +437,12 @@ static bool unpack_trans_table(struct aa_ext *e, struct aa_profile *profile)
 		if (!unpack_nameX(e, AA_STRUCTEND, NULL))
 			goto fail;
 	}
-	return 1;
+	return true;
 
 fail:
 	aa_free_domain_entries(&profile->file.trans);
 	e->pos = pos;
-	return 0;
+	return false;
 }
 
 static bool unpack_rlimits(struct aa_ext *e, struct aa_profile *profile)
@@ -459,11 +472,11 @@ static bool unpack_rlimits(struct aa_ext *e, struct aa_profile *profile)
 		if (!unpack_nameX(e, AA_STRUCTEND, NULL))
 			goto fail;
 	}
-	return 1;
+	return true;
 
 fail:
 	e->pos = pos;
-	return 0;
+	return false;
 }
 
 /**
@@ -476,6 +489,7 @@ static struct aa_profile *unpack_profile(struct aa_ext *e)
 {
 	struct aa_profile *profile = NULL;
 	const char *name = NULL;
+	size_t size = 0;
 	int i, error = -EPROTO;
 	kernel_cap_t tmpcap;
 	u32 tmp;
@@ -576,12 +590,47 @@ static struct aa_profile *unpack_profile(struct aa_ext *e)
 	if (!unpack_rlimits(e, profile))
 		goto fail;
 
+	size = unpack_array(e, "net_allowed_af");
+	if (size) {
+
+		for (i = 0; i < size; i++) {
+			/* discard extraneous rules that this kernel will
+			 * never request
+			 */
+			if (i >= AF_MAX) {
+				u16 tmp;
+				if (!unpack_u16(e, &tmp, NULL) ||
+				    !unpack_u16(e, &tmp, NULL) ||
+				    !unpack_u16(e, &tmp, NULL))
+					goto fail;
+				continue;
+			}
+			if (!unpack_u16(e, &profile->net.allow[i], NULL))
+				goto fail;
+			if (!unpack_u16(e, &profile->net.audit[i], NULL))
+				goto fail;
+			if (!unpack_u16(e, &profile->net.quiet[i], NULL))
+				goto fail;
+		}
+		if (!unpack_nameX(e, AA_ARRAYEND, NULL))
+			goto fail;
+	}
+	/*
+	 * allow unix domain and netlink sockets they are handled
+	 * by IPC
+	 */
+	profile->net.allow[AF_UNIX] = 0xffff;
+	profile->net.allow[AF_NETLINK] = 0xffff;
+
 	if (unpack_nameX(e, AA_STRUCT, "policydb")) {
 		/* generic policy dfa - optional and may be NULL */
 		profile->policy.dfa = unpack_dfa(e);
 		if (IS_ERR(profile->policy.dfa)) {
 			error = PTR_ERR(profile->policy.dfa);
 			profile->policy.dfa = NULL;
+			goto fail;
+		} else if (!profile->policy.dfa) {
+			error = -EPROTO;
 			goto fail;
 		}
 		if (!unpack_u32(e, &profile->policy.start[0], "start"))
@@ -676,9 +725,9 @@ static bool verify_xindex(int xindex, int table_size)
 	int index, xtype;
 	xtype = xindex & AA_X_TYPE_MASK;
 	index = xindex & AA_X_INDEX_MASK;
-	if (xtype == AA_X_TABLE && index > table_size)
-		return 0;
-	return 1;
+	if (xtype == AA_X_TABLE && index >= table_size)
+		return false;
+	return true;
 }
 
 /* verify dfa xindexes are in range of transition tables */
@@ -687,11 +736,11 @@ static bool verify_dfa_xindex(struct aa_dfa *dfa, int table_size)
 	int i;
 	for (i = 0; i < dfa->tables[YYTD_ID_ACCEPT]->td_lolen; i++) {
 		if (!verify_xindex(dfa_user_xindex(dfa, i), table_size))
-			return 0;
+			return false;
 		if (!verify_xindex(dfa_other_xindex(dfa, i), table_size))
-			return 0;
+			return false;
 	}
-	return 1;
+	return true;
 }
 
 /**

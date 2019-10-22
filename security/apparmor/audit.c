@@ -44,6 +44,10 @@ const char *const op_table[] = {
 	"file_mmap",
 	"file_mprotect",
 
+	"pivotroot",
+	"mount",
+	"umount",
+
 	"create",
 	"post_create",
 	"bind",
@@ -200,7 +204,8 @@ int aa_audit(int type, struct aa_profile *profile, gfp_t gfp,
 
 	if (sa->aad->type == AUDIT_APPARMOR_KILL)
 		(void)send_sig_info(SIGKILL, NULL,
-				    sa->u.tsk ?  sa->u.tsk : current);
+			sa->type == LSM_AUDIT_DATA_TASK && sa->u.tsk ?
+				    sa->u.tsk : current);
 
 	if (sa->aad->type == AUDIT_APPARMOR_ALLOWED)
 		return complain_error(sa->aad->error);

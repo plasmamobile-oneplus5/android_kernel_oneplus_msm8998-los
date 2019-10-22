@@ -32,9 +32,11 @@
 #include "include/context.h"
 #include "include/file.h"
 #include "include/ipc.h"
+#include "include/net.h"
 #include "include/path.h"
 #include "include/policy.h"
 #include "include/procattr.h"
+#include "include/mount.h"
 
 /* Flag indicating whether initialization completed */
 int apparmor_initialized __initdata;
@@ -491,6 +493,60 @@ static int apparmor_file_mprotect(struct vm_area_struct *vma,
 			   !(vma->vm_flags & VM_SHARED) ? MAP_PRIVATE : 0);
 }
 
+static int apparmor_sb_mount(const char *dev_name, struct path *path,
+			     const char *type, unsigned long flags, void *data)
+{
+	struct aa_profile *profile;
+	int error = 0;
+
+	/* Discard magic */
+	if ((flags & MS_MGC_MSK) == MS_MGC_VAL)
+		flags &= ~MS_MGC_MSK;
+
+	flags &= ~AA_MS_IGNORE_MASK;
+
+	profile = __aa_current_profile();
+	if (!unconfined(profile)) {
+		if (flags & MS_REMOUNT)
+			error = aa_remount(profile, path, flags, data);
+		else if (flags & MS_BIND)
+			error = aa_bind_mount(profile, path, dev_name, flags);
+		else if (flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE |
+				  MS_UNBINDABLE))
+			error = aa_mount_change_type(profile, path, flags);
+		else if (flags & MS_MOVE)
+			error = aa_move_mount(profile, path, dev_name);
+		else
+			error = aa_new_mount(profile, dev_name, path, type,
+					     flags, data);
+	}
+	return error;
+}
+
+static int apparmor_sb_umount(struct vfsmount *mnt, int flags)
+{
+	struct aa_profile *profile;
+	int error = 0;
+
+	profile = __aa_current_profile();
+	if (!unconfined(profile))
+		error = aa_umount(profile, mnt, flags);
+
+	return error;
+}
+
+static int apparmor_sb_pivotroot(struct path *old_path, struct path *new_path)
+{
+	struct aa_profile *profile;
+	int error = 0;
+
+	profile = __aa_current_profile();
+	if (!unconfined(profile))
+		error = aa_pivotroot(profile, old_path, new_path);
+
+	return error;
+}
+
 static int apparmor_getprocattr(struct task_struct *task, char *name,
 				char **value)
 {
@@ -523,36 +579,36 @@ static int apparmor_setprocattr(struct task_struct *task, char *name,
 {
 	struct common_audit_data sa;
 	struct apparmor_audit_data aad = {0,};
-	char *command, *args = value;
+	char *command, *largs = NULL, *args = value;
 	size_t arg_size;
 	int error;
 
 	if (size == 0)
 		return -EINVAL;
-	/* args points to a PAGE_SIZE buffer, AppArmor requires that
-	 * the buffer must be null terminated or have size <= PAGE_SIZE -1
-	 * so that AppArmor can null terminate them
-	 */
-	if (args[size - 1] != '\0') {
-		if (size == PAGE_SIZE)
-			return -EINVAL;
-		args[size] = '\0';
-	}
-
 	/* task can only write its own attributes */
 	if (current != task)
 		return -EACCES;
 
-	args = value;
+	/* AppArmor requires that the buffer must be null terminated atm */
+	if (args[size - 1] != '\0') {
+		/* null terminate */
+		largs = args = kmalloc(size + 1, GFP_KERNEL);
+		if (!args)
+			return -ENOMEM;
+		memcpy(args, value, size);
+		args[size] = '\0';
+	}
+
+	error = -EINVAL;
 	args = strim(args);
 	command = strsep(&args, " ");
 	if (!args)
-		return -EINVAL;
+		goto out;
 	args = skip_spaces(args);
 	if (!*args)
-		return -EINVAL;
+		goto out;
 
-	arg_size = size - (args - (char *) value);
+	arg_size = size - (args - (largs ? largs : (char *) value));
 	if (strcmp(name, "current") == 0) {
 		if (strcmp(command, "changehat") == 0) {
 			error = aa_setprocattr_changehat(args, arg_size,
@@ -576,10 +632,12 @@ static int apparmor_setprocattr(struct task_struct *task, char *name,
 			goto fail;
 	} else
 		/* only support the "current" and "exec" process attributes */
-		return -EINVAL;
+		goto fail;
 
 	if (!error)
 		error = size;
+out:
+	kfree(largs);
 	return error;
 
 fail:
@@ -588,9 +646,9 @@ fail:
 	aad.profile = aa_current_profile();
 	aad.op = OP_SETPROCATTR;
 	aad.info = name;
-	aad.error = -EINVAL;
+	aad.error = error = -EINVAL;
 	aa_audit_msg(AUDIT_APPARMOR_DENIED, &sa, NULL);
-	return -EINVAL;
+	goto out;
 }
 
 static int apparmor_task_setrlimit(struct task_struct *task,
@@ -605,12 +663,114 @@ static int apparmor_task_setrlimit(struct task_struct *task,
 	return error;
 }
 
+static int apparmor_socket_create(int family, int type, int protocol, int kern)
+{
+	struct aa_profile *profile;
+	int error = 0;
+
+	if (kern)
+		return 0;
+
+	profile = __aa_current_profile();
+	if (!unconfined(profile))
+		error = aa_net_perm(OP_CREATE, profile, family, type, protocol,
+				    NULL);
+	return error;
+}
+
+static int apparmor_socket_bind(struct socket *sock,
+				struct sockaddr *address, int addrlen)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_BIND, sk);
+}
+
+static int apparmor_socket_connect(struct socket *sock,
+				   struct sockaddr *address, int addrlen)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_CONNECT, sk);
+}
+
+static int apparmor_socket_listen(struct socket *sock, int backlog)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_LISTEN, sk);
+}
+
+static int apparmor_socket_accept(struct socket *sock, struct socket *newsock)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_ACCEPT, sk);
+}
+
+static int apparmor_socket_sendmsg(struct socket *sock,
+				   struct msghdr *msg, int size)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_SENDMSG, sk);
+}
+
+static int apparmor_socket_recvmsg(struct socket *sock,
+				   struct msghdr *msg, int size, int flags)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_RECVMSG, sk);
+}
+
+static int apparmor_socket_getsockname(struct socket *sock)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_GETSOCKNAME, sk);
+}
+
+static int apparmor_socket_getpeername(struct socket *sock)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_GETPEERNAME, sk);
+}
+
+static int apparmor_socket_getsockopt(struct socket *sock, int level,
+				      int optname)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_GETSOCKOPT, sk);
+}
+
+static int apparmor_socket_setsockopt(struct socket *sock, int level,
+				      int optname)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_SETSOCKOPT, sk);
+}
+
+static int apparmor_socket_shutdown(struct socket *sock, int how)
+{
+	struct sock *sk = sock->sk;
+
+	return aa_revalidate_sk(OP_SOCK_SHUTDOWN, sk);
+}
+
 static struct security_hook_list apparmor_hooks[] = {
 	LSM_HOOK_INIT(ptrace_access_check, apparmor_ptrace_access_check),
 	LSM_HOOK_INIT(ptrace_traceme, apparmor_ptrace_traceme),
 	LSM_HOOK_INIT(capget, apparmor_capget),
 	LSM_HOOK_INIT(capable, apparmor_capable),
 
+	LSM_HOOK_INIT(sb_mount, apparmor_sb_mount),
+	LSM_HOOK_INIT(sb_umount, apparmor_sb_umount),
+	LSM_HOOK_INIT(sb_pivotroot, apparmor_sb_pivotroot),
+	
 	LSM_HOOK_INIT(path_link, apparmor_path_link),
 	LSM_HOOK_INIT(path_unlink, apparmor_path_unlink),
 	LSM_HOOK_INIT(path_symlink, apparmor_path_symlink),
@@ -633,6 +793,19 @@ static struct security_hook_list apparmor_hooks[] = {
 
 	LSM_HOOK_INIT(getprocattr, apparmor_getprocattr),
 	LSM_HOOK_INIT(setprocattr, apparmor_setprocattr),
+
+	LSM_HOOK_INIT(socket_create, apparmor_socket_create),
+	LSM_HOOK_INIT(socket_bind, apparmor_socket_bind),
+	LSM_HOOK_INIT(socket_connect, apparmor_socket_connect),
+	LSM_HOOK_INIT(socket_listen, apparmor_socket_listen),
+	LSM_HOOK_INIT(socket_accept, apparmor_socket_accept),
+	LSM_HOOK_INIT(socket_sendmsg, apparmor_socket_sendmsg),
+	LSM_HOOK_INIT(socket_recvmsg, apparmor_socket_recvmsg),
+	LSM_HOOK_INIT(socket_getsockname, apparmor_socket_getsockname),
+	LSM_HOOK_INIT(socket_getpeername, apparmor_socket_getpeername),
+	LSM_HOOK_INIT(socket_getsockopt, apparmor_socket_getsockopt),
+	LSM_HOOK_INIT(socket_setsockopt, apparmor_socket_setsockopt),
+	LSM_HOOK_INIT(socket_shutdown, apparmor_socket_shutdown),
 
 	LSM_HOOK_INIT(cred_alloc_blank, apparmor_cred_alloc_blank),
 	LSM_HOOK_INIT(cred_free, apparmor_cred_free),
@@ -749,51 +922,49 @@ __setup("apparmor=", apparmor_enabled_setup);
 /* set global flag turning off the ability to load policy */
 static int param_set_aalockpolicy(const char *val, const struct kernel_param *kp)
 {
-	if (!capable(CAP_MAC_ADMIN))
+	if (!policy_admin_capable())
 		return -EPERM;
-	if (aa_g_lock_policy)
-		return -EACCES;
 	return param_set_bool(val, kp);
 }
 
 static int param_get_aalockpolicy(char *buffer, const struct kernel_param *kp)
 {
-	if (!capable(CAP_MAC_ADMIN))
+	if (!policy_view_capable())
 		return -EPERM;
 	return param_get_bool(buffer, kp);
 }
 
 static int param_set_aabool(const char *val, const struct kernel_param *kp)
 {
-	if (!capable(CAP_MAC_ADMIN))
+	if (!policy_admin_capable())
 		return -EPERM;
 	return param_set_bool(val, kp);
 }
 
 static int param_get_aabool(char *buffer, const struct kernel_param *kp)
 {
-	if (!capable(CAP_MAC_ADMIN))
+	if (!policy_view_capable())
 		return -EPERM;
 	return param_get_bool(buffer, kp);
 }
 
 static int param_set_aauint(const char *val, const struct kernel_param *kp)
 {
-	if (!capable(CAP_MAC_ADMIN))
+	if (!policy_admin_capable())
 		return -EPERM;
 	return param_set_uint(val, kp);
 }
 
 static int param_get_aauint(char *buffer, const struct kernel_param *kp)
 {
-	if (!capable(CAP_MAC_ADMIN))
+	if (!policy_view_capable())
 		return -EPERM;
 	return param_get_uint(buffer, kp);
 }
 
 static int param_get_audit(char *buffer, struct kernel_param *kp)
 {
-	if (!capable(CAP_MAC_ADMIN))
+	if (!policy_view_capable())
 		return -EPERM;
 
 	if (!apparmor_enabled)
@@ -805,7 +976,7 @@ static int param_get_audit(char *buffer, struct kernel_param *kp)
 static int param_set_audit(const char *val, struct kernel_param *kp)
 {
 	int i;
-	if (!capable(CAP_MAC_ADMIN))
+	if (!policy_admin_capable())
 		return -EPERM;
 
 	if (!apparmor_enabled)
@@ -826,7 +997,7 @@ static int param_set_audit(const char *val, struct kernel_param *kp)
 
 static int param_get_mode(char *buffer, struct kernel_param *kp)
 {
-	if (!capable(CAP_MAC_ADMIN))
+	if (!policy_admin_capable())
 		return -EPERM;
 
 	if (!apparmor_enabled)
@@ -838,7 +1009,7 @@ static int param_get_mode(char *buffer, struct kernel_param *kp)
 static int param_set_mode(const char *val, struct kernel_param *kp)
 {
 	int i;
-	if (!capable(CAP_MAC_ADMIN))
+	if (!policy_admin_capable())
 		return -EPERM;
 
 	if (!apparmor_enabled)
