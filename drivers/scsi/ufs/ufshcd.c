@@ -7615,7 +7615,8 @@ static int ufshcd_ioctl(struct scsi_device *dev, int cmd, void __user *buffer)
 
 	BUG_ON(!hba);
 	if (!buffer) {
-		dev_err(hba->dev, "%s: User buffer is NULL!\n", __func__);
+		// UBports: Disable logging for now due to spam (~240 lines in dmesg after boot)
+		//dev_err(hba->dev, "%s: User buffer is NULL!\n", __func__);
 		return -EINVAL;
 	}
 
